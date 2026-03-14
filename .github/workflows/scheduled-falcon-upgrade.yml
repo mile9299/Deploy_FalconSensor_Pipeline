@@ -1,0 +1,320 @@
+name: Scheduled Falcon Sensor Upgrade
+
+# This workflow automatically upgrades Falcon Sensor on a schedule
+# Useful for keeping sensors up-to-date across multiple clusters
+
+on:
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      target_clusters:
+        description: 'Target clusters (all, production, staging)'
+        required: true
+        type: choice
+        options:
+          - all
+          - production
+          - staging
+      sensor_version:
+        description: 'Sensor version (leave empty for latest)'
+        required: false
+        type: string
+
+  # Scheduled trigger - Every Sunday at 2 AM UTC
+  schedule:
+    - cron: '0 2 * * 0'
+
+env:
+  FALCON_NAMESPACE: falcon-system
+
+jobs:
+  # Job to determine which clusters to upgrade
+  determine-clusters:
+    name: Determine Target Clusters
+    runs-on: ubuntu-latest
+    outputs:
+      clusters: ${{ steps.set-clusters.outputs.clusters }}
+
+    steps:
+      - name: Set target clusters
+        id: set-clusters
+        run: |
+          TARGET="${{ github.event.inputs.target_clusters || 'all' }}"
+
+          # Define your clusters here
+          # Format: [{"name": "cluster-name", "provider": "AKS|EKS|GKE", "env": "prod|staging"}]
+
+          if [ "$TARGET" == "production" ]; then
+            CLUSTERS='[
+              {"name": "prod-aks-cluster", "provider": "AKS", "env": "production"},
+              {"name": "prod-eks-cluster", "provider": "EKS", "env": "production"},
+              {"name": "prod-gke-cluster", "provider": "GKE", "env": "production"}
+            ]'
+          elif [ "$TARGET" == "staging" ]; then
+            CLUSTERS='[
+              {"name": "staging-aks-cluster", "provider": "AKS", "env": "staging"},
+              {"name": "staging-gke-cluster", "provider": "GKE", "env": "staging"}
+            ]'
+          else
+            # All clusters
+            CLUSTERS='[
+              {"name": "prod-aks-cluster", "provider": "AKS", "env": "production"},
+              {"name": "prod-eks-cluster", "provider": "EKS", "env": "production"},
+              {"name": "prod-gke-cluster", "provider": "GKE", "env": "production"},
+              {"name": "staging-aks-cluster", "provider": "AKS", "env": "staging"},
+              {"name": "staging-gke-cluster", "provider": "GKE", "env": "staging"}
+            ]'
+          fi
+
+          echo "clusters=$CLUSTERS" >> $GITHUB_OUTPUT
+          echo "Target clusters: $CLUSTERS"
+
+  # Job to upgrade sensors on each cluster
+  upgrade-sensor:
+    name: Upgrade ${{ matrix.cluster.name }}
+    runs-on: ubuntu-latest
+    needs: determine-clusters
+
+    strategy:
+      # Run upgrades sequentially (set to true for parallel)
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        cluster: ${{ fromJson(needs.determine-clusters.outputs.clusters) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Cloud CLI
+        run: |
+          case "${{ matrix.cluster.provider }}" in
+            AKS)
+              echo "Installing Azure CLI..."
+              curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+              ;;
+            EKS)
+              echo "AWS CLI already available"
+              ;;
+            GKE)
+              echo "Google Cloud SDK already available"
+              ;;
+          esac
+
+      - name: Authenticate to Cloud Provider
+        run: |
+          case "${{ matrix.cluster.provider }}" in
+            AKS)
+              az login --service-principal \
+                -u "${{ secrets.AZURE_CLIENT_ID }}" \
+                -p "${{ secrets.AZURE_CLIENT_SECRET }}" \
+                --tenant "${{ secrets.AZURE_TENANT_ID }}"
+              az account set --subscription "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+              ;;
+            EKS)
+              aws configure set aws_access_key_id "${{ secrets.AWS_ACCESS_KEY_ID }}"
+              aws configure set aws_secret_access_key "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+              aws configure set region "${{ secrets.AWS_REGION }}"
+              ;;
+            GKE)
+              echo "${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}" > /tmp/gcp-key.json
+              gcloud auth activate-service-account --key-file=/tmp/gcp-key.json
+              gcloud config set project "${{ secrets.GCP_PROJECT_ID }}"
+              ;;
+          esac
+
+      - name: Install kubectl and Helm
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'latest'
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'latest'
+
+      - name: Configure kubectl
+        run: |
+          case "${{ matrix.cluster.provider }}" in
+            AKS)
+              az aks get-credentials \
+                --resource-group "${{ secrets.AKS_RESOURCE_GROUP }}" \
+                --name "${{ matrix.cluster.name }}" \
+                --overwrite-existing
+              ;;
+            EKS)
+              aws eks update-kubeconfig \
+                --name "${{ matrix.cluster.name }}" \
+                --region "${{ secrets.AWS_REGION }}"
+              ;;
+            GKE)
+              gcloud container clusters get-credentials "${{ matrix.cluster.name }}" \
+                --region "${{ secrets.GCP_REGION }}" \
+                --project "${{ secrets.GCP_PROJECT_ID }}"
+              ;;
+          esac
+
+      - name: Check current sensor version
+        id: current-version
+        continue-on-error: true
+        run: |
+          echo "Checking current Falcon Sensor version..."
+          CURRENT_VERSION=$(helm list -n $FALCON_NAMESPACE -o json | jq -r '.[] | select(.name=="falcon-sensor") | .app_version' || echo "not-installed")
+          echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          echo "Current version: $CURRENT_VERSION"
+
+      - name: Download Falcon Pull Script
+        run: |
+          curl -sSL -o falcon-container-sensor-pull.sh \
+            "https://raw.githubusercontent.com/CrowdStrike/falcon-scripts/main/bash/containers/falcon-container-sensor-pull/falcon-container-sensor-pull.sh"
+          chmod +x falcon-container-sensor-pull.sh
+
+      - name: Get Pull Token and Sensor Version
+        id: falcon-info
+        run: |
+          PULL_TOKEN=$(./falcon-container-sensor-pull.sh \
+            -u "${{ secrets.FALCON_CLIENT_ID }}" \
+            -s "${{ secrets.FALCON_CLIENT_SECRET }}" \
+            --type falcon-sensor \
+            --platform x86_64 \
+            --get-pull-token)
+
+          echo "pull_token=$PULL_TOKEN" >> $GITHUB_OUTPUT
+
+          if [ -n "${{ github.event.inputs.sensor_version }}" ]; then
+            SENSOR_TAG="${{ github.event.inputs.sensor_version }}"
+          else
+            SENSOR_TAG=$(./falcon-container-sensor-pull.sh \
+              -u "${{ secrets.FALCON_CLIENT_ID }}" \
+              -s "${{ secrets.FALCON_CLIENT_SECRET }}" \
+              --type falcon-sensor \
+              --platform x86_64 \
+              --list-tags | grep -E "^[0-9]+\.[0-9]+\.[0-9]+" | head -1)
+          fi
+
+          echo "sensor_tag=$SENSOR_TAG" >> $GITHUB_OUTPUT
+          echo "Latest sensor version: $SENSOR_TAG"
+
+      - name: Add Helm Repository
+        run: |
+          helm repo add crowdstrike https://crowdstrike.github.io/falcon-helm
+          helm repo update
+
+      - name: Detect GKE Autopilot
+        id: autopilot
+        if: matrix.cluster.provider == 'GKE'
+        run: |
+          if kubectl get nodes -o json | grep -q '"cloud.google.com/gke-autopilot"'; then
+            echo "is_autopilot=true" >> $GITHUB_OUTPUT
+            echo "✓ GKE Autopilot detected"
+          else
+            echo "is_autopilot=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upgrade Falcon Sensor
+        run: |
+          echo "=========================================="
+          echo "Upgrading Falcon Sensor"
+          echo "=========================================="
+          echo "Cluster: ${{ matrix.cluster.name }}"
+          echo "Provider: ${{ matrix.cluster.provider }}"
+          echo "Environment: ${{ matrix.cluster.env }}"
+          echo "Current Version: ${{ steps.current-version.outputs.current_version }}"
+          echo "Target Version: ${{ steps.falcon-info.outputs.sensor_tag }}"
+          echo "=========================================="
+          echo ""
+
+          # Build Helm command
+          HELM_CMD="helm upgrade --install falcon-sensor crowdstrike/falcon-sensor"
+          HELM_CMD="$HELM_CMD --namespace $FALCON_NAMESPACE"
+          HELM_CMD="$HELM_CMD --create-namespace"
+          HELM_CMD="$HELM_CMD --set falcon.cid=${{ secrets.FALCON_CID }}"
+          HELM_CMD="$HELM_CMD --set node.image.registryConfigJSON=${{ steps.falcon-info.outputs.pull_token }}"
+          HELM_CMD="$HELM_CMD --set node.image.repository=registry.crowdstrike.com/falcon-sensor/release/falcon-sensor"
+          HELM_CMD="$HELM_CMD --set node.image.tag=${{ steps.falcon-info.outputs.sensor_tag }}"
+
+          # Add GKE Autopilot settings if needed
+          if [ "${{ steps.autopilot.outputs.is_autopilot }}" == "true" ]; then
+            HELM_CMD="$HELM_CMD --set node.backend=bpf"
+            HELM_CMD="$HELM_CMD --set node.gke.autopilot=true"
+          fi
+
+          # Execute upgrade
+          eval "$HELM_CMD"
+
+      - name: Wait for rollout
+        run: |
+          echo "Waiting for DaemonSet rollout..."
+          kubectl rollout status daemonset/falcon-node-sensor -n $FALCON_NAMESPACE --timeout=300s
+
+      - name: Verify upgrade
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "Verification Results"
+          echo "=========================================="
+
+          echo ""
+          echo "Helm Release:"
+          helm list -n $FALCON_NAMESPACE
+
+          echo ""
+          echo "DaemonSet:"
+          kubectl get daemonset falcon-node-sensor -n $FALCON_NAMESPACE
+
+          echo ""
+          echo "Pods:"
+          kubectl get pods -n $FALCON_NAMESPACE -l app.kubernetes.io/name=falcon-sensor
+
+          # Check if all pods are running
+          NOT_RUNNING=$(kubectl get pods -n $FALCON_NAMESPACE -l app.kubernetes.io/name=falcon-sensor -o json | jq -r '.items[] | select(.status.phase!="Running") | .metadata.name' | wc -l)
+
+          if [ "$NOT_RUNNING" -gt 0 ]; then
+            echo ""
+            echo "⚠️  Warning: Some pods are not running"
+            kubectl get pods -n $FALCON_NAMESPACE -l app.kubernetes.io/name=falcon-sensor
+            exit 1
+          else
+            echo ""
+            echo "✓ All pods are running successfully"
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f /tmp/gcp-key.json
+          rm -f falcon-container-sensor-pull.sh
+
+  # Summary job
+  upgrade-summary:
+    name: Upgrade Summary
+    runs-on: ubuntu-latest
+    needs: [determine-clusters, upgrade-sensor]
+    if: always()
+
+    steps:
+      - name: Generate Summary
+        run: |
+          echo "=========================================="
+          echo "Falcon Sensor Upgrade Summary"
+          echo "=========================================="
+          echo ""
+          echo "Trigger: ${{ github.event_name }}"
+          echo "Status: ${{ needs.upgrade-sensor.result }}"
+          echo "Clusters: ${{ github.event.inputs.target_clusters || 'all' }}"
+          echo "Version: ${{ github.event.inputs.sensor_version || 'latest' }}"
+          echo ""
+
+          if [ "${{ needs.upgrade-sensor.result }}" == "success" ]; then
+            echo "✓ All upgrades completed successfully"
+          else
+            echo "⚠️  Some upgrades failed - check logs"
+          fi
+          echo ""
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "❌ Upgrade workflow failed"
+          echo "Check the workflow logs for details"
+          # Add notification steps here (Slack, email, etc.)
